@@ -1,0 +1,55 @@
+# go-virtio/sound CI — build, vet and test with coverage on every
+# push/PR. We keep the matrix small: this is a pure-Go package with no
+# OS-specific bits, so a single ubuntu runner per supported Go version
+# is enough.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ["1.25.x"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sound
+      - uses: actions/checkout@v4
+        with:
+          repository: go-virtio/common
+          path: common
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+      - name: go vet
+        working-directory: sound
+        # -unsafeptr=false: buffer.go intentionally lifts a uintptr DMA
+        # address back into a []byte view of identity-mapped device
+        # memory. vet's unsafeptr heuristic flags this; we know it's
+        # correct on the supported (UEFI / bare-metal) hosts.
+        run: go vet -unsafeptr=false ./...
+      - name: go test (race + coverage)
+        working-directory: sound
+        # -gcflags=all=-d=checkptr=0 disables the checkptr instrumentation
+        # the race detector enables. buffer.go intentionally lifts a
+        # uintptr DMA address (returned by the PageAllocator and parked
+        # in the per-descriptor bookkeeping) back into a []byte view of
+        # device memory; checkptr cannot reason about identity-mapped
+        # DMA pages and would false-positive every Read/Write call.
+        run: go test -race -gcflags=all=-d=checkptr=0 -covermode=atomic -coverprofile=coverage.out ./...
+      - name: coverage gate
+        working-directory: sound
+        run: |
+          pct=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit (p+0 >= 85.0) ? 0 : 1 }' || {
+            echo "coverage below 85% gate"
+            exit 1
+          }
