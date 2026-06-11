@@ -37,6 +37,9 @@ func (v *VirtioSound) PCMInfo() ([]PCMInfoEntry, error) {
 			return nil, perr
 		}
 		out[i] = entry
+		// v0.2.0: cache so PCMSetParams / PCMSetParamsTyped can
+		// validate the requested (rate, format, channels) tuple.
+		v.cacheStreamInfo(i, entry)
 	}
 	return out, nil
 }
@@ -46,8 +49,19 @@ func (v *VirtioSound) PCMInfo() ([]PCMInfoEntry, error) {
 // sample format and rate for a single stream.
 //
 // MUST be called once before PCMPrepare for a given stream.
+//
+// v0.2.0: if the driver has previously cached PCMInfo (via PCMInfo()),
+// PCMSetParams validates the (rate, format, channels) tuple against the
+// stream's advertised bitmap and returns ErrUnsupportedRate /
+// ErrUnsupportedFormat / ErrUnsupportedChannelCount when the request
+// is outside the device's range. Pre-PCMInfo callers see no
+// validation — backward-compat with v0.1.0 callers that never call
+// PCMInfo before PCMSetParams.
 func (v *VirtioSound) PCMSetParams(streamID uint32, p PCMParams) error {
 	if err := v.checkStreamID(streamID); err != nil {
+		return err
+	}
+	if err := v.validateParams(streamID, p); err != nil {
 		return err
 	}
 	req := buildPCMSetParamsReq(streamID, p)
@@ -58,7 +72,78 @@ func (v *VirtioSound) PCMSetParams(streamID uint32, p PCMParams) error {
 	if status != SOK {
 		return ErrDeviceStatus
 	}
+	v.recordStreamParams(streamID, p)
 	return nil
+}
+
+// PCMSetParamsTyped is the v0.2.0 helper that accepts typed PCMRate /
+// PCMFormat single-bit constants (e.g. Rate11025, FormatU8) instead of
+// the raw PCMFmt* / PCMRate* byte IDs the MVP-shape PCMParams uses.
+// Internally it converts the typed bitmaps via ByteID() then delegates
+// to PCMSetParams.
+//
+// Returns ErrInvalidRateValue / ErrInvalidFormatValue if the caller
+// passes a multi-bit bitmap (the helper expects a single-bit constant);
+// surface validation errors are the same as PCMSetParams.
+func (v *VirtioSound) PCMSetParamsTyped(streamID uint32, p TypedPCMParams) error {
+	if !isSingleBit(uint64(p.Rate)) || p.Rate == 0 {
+		return ErrInvalidRateValue
+	}
+	if !isSingleBit(uint64(p.Format)) || p.Format == 0 {
+		return ErrInvalidFormatValue
+	}
+	return v.PCMSetParams(streamID, PCMParams{
+		BufferBytes: p.BufferBytes,
+		PeriodBytes: p.PeriodBytes,
+		Features:    p.Features,
+		Channels:    p.Channels,
+		Format:      p.Format.ByteID(),
+		Rate:        p.Rate.ByteID(),
+	})
+}
+
+// validateParams checks the (rate, format, channels) tuple in `p`
+// against the cached PCMInfo bitmap for `streamID`. Returns nil if the
+// driver has not cached PCMInfo (no info ⇒ no validation possible) or
+// if every dimension is in range.
+func (v *VirtioSound) validateParams(streamID uint32, p PCMParams) error {
+	info, ok := v.cachedStreamInfo(streamID)
+	if !ok {
+		return nil
+	}
+	if info.Rates&(1<<p.Rate) == 0 {
+		return ErrUnsupportedRate
+	}
+	if info.Formats&(1<<p.Format) == 0 {
+		return ErrUnsupportedFormat
+	}
+	if p.Channels < info.ChannelsMin || p.Channels > info.ChannelsMax {
+		return ErrUnsupportedChannelCount
+	}
+	return nil
+}
+
+// isSingleBit reports whether x has exactly one bit set. Used by the
+// typed-params helper to enforce single-rate / single-format inputs.
+func isSingleBit(x uint64) bool { return x != 0 && (x&(x-1)) == 0 }
+
+// TypedPCMParams is the v0.2.0 typed-bitmap variant of PCMParams. The
+// `Rate` and `Format` fields are PCMRate / PCMFormat single-bit
+// constants (Rate11025, FormatU8, ...) instead of the raw byte IDs the
+// MVP-shape PCMParams uses.
+type TypedPCMParams struct {
+	// BufferBytes / PeriodBytes / Features / Channels — same semantics
+	// as PCMParams.
+	BufferBytes uint32
+	PeriodBytes uint32
+	Features    uint32
+	Channels    uint8
+
+	// Format is a PCMFormat single-bit constant (Format* in messages.go).
+	Format PCMFormat
+
+	// Rate is a PCMRate single-bit constant (Rate* in messages.go).
+	Rate PCMRate
 }
 
 // PCMPrepare issues a R_PCM_PREPARE command (Virtio 1.2 §5.14.6.6.3.3)

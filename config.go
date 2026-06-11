@@ -32,10 +32,20 @@ const (
 	CfgStreams uint32 = 4
 	CfgChmaps  uint32 = 8
 
-	// CfgTotalSize is the on-the-wire size of struct virtio_snd_config.
-	// Exposed so tests can build a fake device-config region of the
-	// exact right size.
-	CfgTotalSize uint32 = 12
+	// CfgControls is the controls-count field appended to the
+	// device-config region when VIRTIO_SND_F_CTLS is negotiated
+	// (Virtio 1.2 §5.14.4 — the field exists in the spec even before
+	// F_CTLS, but is only meaningful when F_CTLS is up). v0.2.0 reads
+	// it lazily from Controls() so v0.1.0 hosts that publish only the
+	// first three fields don't error during init.
+	CfgControls uint32 = 12
+
+	// CfgTotalSize is the on-the-wire size of struct virtio_snd_config
+	// for the F_CTLS-aware device. v0.2.0 reads the controls counter
+	// only when F_CTLS is up; init still reads only the first 12
+	// bytes so non-F_CTLS hosts that publish a 12-byte device-config
+	// region keep working.
+	CfgTotalSize uint32 = 16
 )
 
 // DeviceConfig is the parsed device-config region. All three fields are

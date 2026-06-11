@@ -54,12 +54,12 @@ const (
 	XferPollIterations = 200000
 )
 
-// AcceptedFeatures is the feature mask the driver negotiates ON. For
-// the single-jack baseline the only bit we ever accept is the
-// non-negotiable VIRTIO_F_VERSION_1 (modern transport).
-// VIRTIO_SND_F_CTLS (0) is deliberately masked OUT — the MVP does not
-// drive the control jack.
-const AcceptedFeatures uint64 = common.FeatureVersion1
+// AcceptedFeatures is the feature mask the driver negotiates ON.
+// v0.2.0 accepts VIRTIO_F_VERSION_1 (modern transport, mandatory) plus
+// VIRTIO_SND_F_CTLS (bit 0) when the host offers it — when CTLS is
+// negotiated, Controls() / ControlRead() / ControlWrite() /
+// SetVolume() / SetMute() become usable.
+const AcceptedFeatures uint64 = common.FeatureVersion1 | FeatureCTLS
 
 // AcceptFeatures returns the negotiated feature mask: the intersection
 // of what the device offers and what we accept. The caller writes this
@@ -100,7 +100,110 @@ type VirtioSound struct {
 	eventq *common.Virtqueue
 	txq    *common.Virtqueue
 	rxq    *common.Virtqueue
+
+	// streams is the per-stream state registry (v0.2.0). Populated on
+	// PCMInfo() / PCMSetParams() and consulted by PCMSetParams /
+	// PCMSetParamsTyped to validate the requested (rate, format,
+	// channels) tuple against the device-advertised bitmaps. Lazily
+	// allocated so that v0.1.0 callers that never touch PCMInfo see no
+	// extra allocations.
+	streams []streamState
+
+	// asyncCookies tracks WriteAsync chains awaiting completion on the
+	// txq. Indexed by `cookie` (a monotonically increasing uint64); the
+	// value is the descriptor head index the caller should reclaim when
+	// the completion event is consumed via ReadEvents().
+	asyncCookies map[uint64]asyncInflight
+	nextCookie   uint64
+
+	// pendingEvents queues completion / xrun / period-elapsed events
+	// pulled out of the eventq + the txq's used-ring on each
+	// ReadEvents() call. v0.2.0 surfaces these to the caller; v0.1.0
+	// drained-on-busy-poll Write() ignored them.
+	pendingEvents []Event
 }
+
+// streamState is the per-stream cache populated when the driver issues
+// PCMInfo() — it lets PCMSetParams validate the requested (rate,
+// format, channels) tuple against what the device actually advertises.
+// `infoCached` distinguishes "PCMInfo hasn't been called for this
+// stream" from "PCMInfo returned a zero record" (an empty bitmap is a
+// legitimate device response that should reject every SetParams call).
+type streamState struct {
+	infoCached  bool
+	info        PCMInfoEntry
+	lastParams  PCMParams
+	paramsValid bool
+}
+
+// asyncInflight tracks one in-flight WriteAsync chain. `head` is the
+// virtqueue descriptor head index to reclaim once the device publishes
+// a used-ring entry for it. `statusOff` is the offset within `mem`
+// where the device writes the virtio_snd_pcm_status trailer.
+type asyncInflight struct {
+	streamID  uint32
+	head      uint16
+	mem       []byte
+	statusOff uint32
+	dataLen   uint32
+}
+
+// Event is the v0.2.0 driver-side representation of a completion event
+// pulled off the txq used-ring or the eventq. Distinct from a raw
+// VIRTIO_SND_EVT_* device event — the driver surfaces a normalised
+// shape covering "this WriteAsync cookie completed", "the device fired
+// a period-elapsed notification", "the stream went into xrun", and
+// (when F_CTLS is up) "a control element changed".
+type Event struct {
+	// Kind is one of the EventKind* constants — what happened.
+	Kind EventKind
+
+	// StreamID is the stream the event pertains to, when meaningful
+	// (Kind in {EventKindWriteComplete, EventKindPeriodElapsed,
+	// EventKindXrun}). Zero for control-element events.
+	StreamID uint32
+
+	// Cookie is the WriteAsync cookie that finished, when
+	// Kind==EventKindWriteComplete. Zero otherwise.
+	Cookie uint64
+
+	// BytesAccepted is the device's view of how many payload bytes it
+	// consumed for the completed chain (excludes the 4-byte xfer header
+	// and the 8-byte status trailer). Zero when not meaningful.
+	BytesAccepted uint32
+
+	// StatusCode is the raw VIRTIO_SND_S_* status code the device wrote
+	// into the chain's status trailer. SOK on a clean completion.
+	StatusCode uint32
+
+	// ControlID is the control-element ID for EventKindControlChanged
+	// events (F_CTLS). Zero otherwise.
+	ControlID uint32
+}
+
+// EventKind classifies an Event.
+type EventKind uint8
+
+// EventKind* constants. Stable on the wire (the driver may serialise
+// events for cross-process delivery, e.g. via a vsock bridge).
+const (
+	// EventKindUnknown is the zero value — an Event with this kind is
+	// always a programmer error.
+	EventKindUnknown EventKind = 0
+	// EventKindWriteComplete is emitted when a WriteAsync chain hits
+	// the used-ring. `Cookie` is the matching WriteAsync return value.
+	EventKindWriteComplete EventKind = 1
+	// EventKindPeriodElapsed is the device's VIRTIO_SND_EVT_PCM_PERIOD_ELAPSED.
+	EventKindPeriodElapsed EventKind = 2
+	// EventKindXrun is the device's VIRTIO_SND_EVT_PCM_XRUN.
+	EventKindXrun EventKind = 3
+	// EventKindJackConnected is VIRTIO_SND_EVT_JACK_CONNECTED.
+	EventKindJackConnected EventKind = 4
+	// EventKindJackDisconnected is VIRTIO_SND_EVT_JACK_DISCONNECTED.
+	EventKindJackDisconnected EventKind = 5
+	// EventKindControlChanged is VIRTIO_SND_EVT_CTL_NOTIFY (F_CTLS).
+	EventKindControlChanged EventKind = 6
+)
 
 // OpenVirtioSound drives the full bring-up of one virtio-sound device:
 //
@@ -406,17 +509,87 @@ func (v *VirtioSound) controlRoundTrip(req []byte, extraLen uint32) (status uint
 // Sentinel errors for the virtio-sound path. All exported so callers
 // can branch + format them.
 var (
-	ErrNotModernDevice   = commonSoundError("go-virtio/sound: device doesn't offer VIRTIO_F_VERSION_1 (legacy-only)")
-	ErrFeaturesNotOK     = commonSoundError("go-virtio/sound: FEATURES_OK status bit didn't stick after DriverFeature write")
-	ErrInitWrongDeviceID = commonSoundError("go-virtio/sound: PCI device ID is not 0x1059 (modern sound device)")
-	ErrQueueNotAvailable = commonSoundError("go-virtio/sound: device reports QueueSize=0 for a required queue")
-	ErrBufferTooSmall    = commonSoundError("go-virtio/sound: PageAllocator returned a chunk smaller than one page")
-	ErrControlTimeout    = commonSoundError("go-virtio/sound: controlq poll timeout (device did not respond)")
-	ErrXferTimeout       = commonSoundError("go-virtio/sound: PCM xfer poll timeout (device did not return descriptor)")
-	ErrShortResponse     = commonSoundError("go-virtio/sound: device response shorter than expected struct size")
-	ErrDeviceStatus      = commonSoundError("go-virtio/sound: device reported non-OK status for controlq command")
-	ErrStreamIDOutOfRange = commonSoundError("go-virtio/sound: stream id is outside the device-advertised range")
+	ErrNotModernDevice         = commonSoundError("go-virtio/sound: device doesn't offer VIRTIO_F_VERSION_1 (legacy-only)")
+	ErrFeaturesNotOK           = commonSoundError("go-virtio/sound: FEATURES_OK status bit didn't stick after DriverFeature write")
+	ErrInitWrongDeviceID       = commonSoundError("go-virtio/sound: PCI device ID is not 0x1059 (modern sound device)")
+	ErrQueueNotAvailable       = commonSoundError("go-virtio/sound: device reports QueueSize=0 for a required queue")
+	ErrBufferTooSmall          = commonSoundError("go-virtio/sound: PageAllocator returned a chunk smaller than one page")
+	ErrControlTimeout          = commonSoundError("go-virtio/sound: controlq poll timeout (device did not respond)")
+	ErrXferTimeout             = commonSoundError("go-virtio/sound: PCM xfer poll timeout (device did not return descriptor)")
+	ErrShortResponse           = commonSoundError("go-virtio/sound: device response shorter than expected struct size")
+	ErrDeviceStatus            = commonSoundError("go-virtio/sound: device reported non-OK status for controlq command")
+	ErrStreamIDOutOfRange      = commonSoundError("go-virtio/sound: stream id is outside the device-advertised range")
+	ErrUnsupportedRate         = commonSoundError("go-virtio/sound: requested rate is not in the stream's advertised bitmap")
+	ErrUnsupportedFormat       = commonSoundError("go-virtio/sound: requested format is not in the stream's advertised bitmap")
+	ErrUnsupportedChannelCount = commonSoundError("go-virtio/sound: requested channel count is outside the stream's advertised range")
+	ErrInvalidRateValue        = commonSoundError("go-virtio/sound: typed rate must be a single-bit PCMRate constant")
+	ErrInvalidFormatValue      = commonSoundError("go-virtio/sound: typed format must be a single-bit PCMFormat constant")
+	ErrInvalidControlID        = commonSoundError("go-virtio/sound: control id is outside the device-advertised range")
+	ErrInvalidControlValues    = commonSoundError("go-virtio/sound: control values slice length does not match control's NumChannels")
+	ErrControlsNotNegotiated   = commonSoundError("go-virtio/sound: VIRTIO_SND_F_CTLS was not negotiated with the device")
+	ErrCookieNotFound          = commonSoundError("go-virtio/sound: WriteAsync cookie not tracked (already drained?)")
+	ErrInvalidVolumePercent    = commonSoundError("go-virtio/sound: volume percent must be in [0,100]")
 )
+
+// ensureStreams lazily allocates the per-stream state registry once
+// PCMInfo / PCMSetParams need it. Idempotent.
+func (v *VirtioSound) ensureStreams() {
+	if v.streams == nil && v.Device.Streams > 0 {
+		v.streams = make([]streamState, v.Device.Streams)
+	}
+}
+
+// cacheStreamInfo records a PCMInfo entry for `streamID` so subsequent
+// PCMSetParams calls can validate the (rate, format, channels) tuple
+// against it. Called by PCMInfo() after the device's response parses
+// cleanly.
+func (v *VirtioSound) cacheStreamInfo(streamID uint32, info PCMInfoEntry) {
+	v.ensureStreams()
+	if int(streamID) >= len(v.streams) {
+		return
+	}
+	v.streams[streamID].infoCached = true
+	v.streams[streamID].info = info
+}
+
+// cachedStreamInfo returns the cached PCMInfo entry for `streamID`,
+// along with a "is cached?" flag. Returns (zero, false) when PCMInfo()
+// has never been called.
+func (v *VirtioSound) cachedStreamInfo(streamID uint32) (PCMInfoEntry, bool) {
+	if int(streamID) >= len(v.streams) {
+		return PCMInfoEntry{}, false
+	}
+	if !v.streams[streamID].infoCached {
+		return PCMInfoEntry{}, false
+	}
+	return v.streams[streamID].info, true
+}
+
+// recordStreamParams remembers the params the driver last sent for
+// `streamID`. Used by SetVolume to scale the requested percent against
+// the stream's channel count, and for diagnostic dumps.
+func (v *VirtioSound) recordStreamParams(streamID uint32, p PCMParams) {
+	v.ensureStreams()
+	if int(streamID) >= len(v.streams) {
+		return
+	}
+	v.streams[streamID].lastParams = p
+	v.streams[streamID].paramsValid = true
+}
+
+// StreamParams returns the last params the driver successfully sent for
+// `streamID` along with a flag indicating whether PCMSetParams has run
+// at least once. Useful for callers building latency / underrun
+// diagnostics without re-issuing controlq round-trips.
+func (v *VirtioSound) StreamParams(streamID uint32) (PCMParams, bool) {
+	if int(streamID) >= len(v.streams) {
+		return PCMParams{}, false
+	}
+	if !v.streams[streamID].paramsValid {
+		return PCMParams{}, false
+	}
+	return v.streams[streamID].lastParams, true
+}
 
 // commonSoundError is the package's tiny sentinel-error type — same
 // pattern as go-virtio/common.commonError and

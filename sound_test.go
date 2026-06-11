@@ -46,8 +46,9 @@ type fakeSoundDevice struct {
 	qdevice    map[uint16]uint64
 	qnotifyOff map[uint16]uint16
 
-	// Device-config region (12 bytes: jacks / streams / chmaps).
-	devcfg [12]byte
+	// Device-config region (16 bytes in v0.2.0: jacks / streams /
+	// chmaps / controls).
+	devcfg [16]byte
 
 	// BAR memory store (other reads/writes).
 	bar map[uint64]uint64 // key = (bar<<48 | offset)
@@ -60,6 +61,9 @@ type fakeSoundDevice struct {
 	ctrlCompletes bool
 	txCompletes   bool
 	rxCompletes   bool
+	// txDeferComplete: when true, doorbell does NOT publish a used-
+	// ring entry; the test triggers it manually via deliverTxComplete().
+	txDeferComplete bool
 
 	// ctrlStatus is the status code the device writes into the
 	// virtio_snd_hdr response. Default SOK.
@@ -82,6 +86,26 @@ type fakeSoundDevice struct {
 	// rxPayload is the bytes the device writes into the rx data
 	// buffer on a capture completion.
 	rxPayload []byte
+
+	// pcmInfoOverrides[streamID] overrides the default PCM_INFO entry
+	// the device returns. Used by the rate / format / multi-port tests
+	// to advertise specific format+rate bitmaps.
+	pcmInfoOverrides map[uint32]PCMInfoEntry
+
+	// controls is the device's control-element table (F_CTLS). When
+	// non-empty, R_CTL_INFO returns these; R_CTL_READ returns
+	// controlValues[id]; R_CTL_WRITE updates them.
+	controls      []Control
+	controlValues map[uint32][]int32
+
+	// txDeferred is the queue of head-indices the fake will publish on
+	// the next deliverTxComplete() call when txDeferComplete is set.
+	txDeferred []uint16
+
+	// lastSetParamsReq is a copy of the last R_PCM_SET_PARAMS request
+	// body the fake observed — used by tests to assert the rate +
+	// format bytes hit the wire as expected.
+	lastSetParamsReq []byte
 }
 
 func newFakeSoundDevice(deviceFeats uint64) *fakeSoundDevice {
@@ -102,12 +126,21 @@ func newFakeSoundDevice(deviceFeats uint64) *fakeSoundDevice {
 		pcmInfoSeed:    0xAA,
 	}
 	// Advertise: jacks=1, streams=2 (one playback, one capture),
-	// chmaps=1.
+	// chmaps=1, controls=0 (filled in per-test via setControls).
 	binary.LittleEndian.PutUint32(d.devcfg[0:4], 1)
 	binary.LittleEndian.PutUint32(d.devcfg[4:8], 2)
 	binary.LittleEndian.PutUint32(d.devcfg[8:12], 1)
+	binary.LittleEndian.PutUint32(d.devcfg[12:16], 0)
 	d.cfg = buildVirtioSoundCfgSpace()
 	return d
+}
+
+// setControls populates the F_CTLS control table and bumps the
+// device-config region's controls counter.
+func (d *fakeSoundDevice) setControls(ctrls []Control, values map[uint32][]int32) {
+	d.controls = ctrls
+	d.controlValues = values
+	binary.LittleEndian.PutUint32(d.devcfg[12:16], uint32(len(ctrls)))
 }
 
 func barKey(bar uint8, off uint64) uint64 { return uint64(bar)<<48 | off }
@@ -339,6 +372,15 @@ func (d *fakeSoundDevice) handleNotify(qIdx uint16) {
 		if !d.txCompletes {
 			return
 		}
+		if d.txDeferComplete {
+			// Capture the head index for the test to release later via
+			// deliverTxComplete().
+			head := d.peekLastHead(qIdx)
+			d.mu.Lock()
+			d.txDeferred = append(d.txDeferred, head)
+			d.mu.Unlock()
+			return
+		}
 		d.completeChain(qIdx, d.processTx)
 	case RxQueueIdx:
 		if !d.rxCompletes {
@@ -386,6 +428,119 @@ func (d *fakeSoundDevice) completeChain(qIdx uint16, process func(desc []byte, h
 	uo := 4 + int(slot)*8
 	le.PutUint32(usedSlice[uo:uo+4], uint32(head))
 	le.PutUint32(usedSlice[uo+4:uo+8], length)
+	le.PutUint16(usedSlice[2:4], usedIdx+1)
+}
+
+// peekLastHead returns the head-index of the most-recently-published
+// chain on queue `qIdx`, without dequeueing anything. Used by
+// deferred-tx tests.
+func (d *fakeSoundDevice) peekLastHead(qIdx uint16) uint16 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	availAddr := d.qdriver[qIdx]
+	if availAddr == 0 {
+		return 0
+	}
+	size := d.qsize[qIdx]
+	availSlice := readBufferBytes(uintptr(availAddr), 4+2*int(size))
+	if availSlice == nil {
+		return 0
+	}
+	availIdx := le.Uint16(availSlice[2:4])
+	if availIdx == 0 {
+		return 0
+	}
+	lastSlot := (availIdx - 1) % size
+	return le.Uint16(availSlice[4+lastSlot*2 : 4+lastSlot*2+2])
+}
+
+// deliverTxComplete releases one pending deferred-tx completion, walking
+// the buffered head and publishing a used-ring entry.
+func (d *fakeSoundDevice) deliverTxComplete() {
+	d.mu.Lock()
+	if len(d.txDeferred) == 0 {
+		d.mu.Unlock()
+		return
+	}
+	head := d.txDeferred[0]
+	d.txDeferred = d.txDeferred[1:]
+	d.mu.Unlock()
+	d.completeKnownChain(TxQueueIdx, head, d.processTx)
+}
+
+// completeKnownChain is completeChain with a caller-supplied `head`
+// (rather than dequeueing from the avail-ring). Used by
+// deliverTxComplete.
+func (d *fakeSoundDevice) completeKnownChain(qIdx, head uint16, process func(desc []byte, head uint16) uint32) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	usedAddr := d.qdevice[qIdx]
+	descAddr := d.qdesc[qIdx]
+	if usedAddr == 0 || descAddr == 0 {
+		return
+	}
+	size := d.qsize[qIdx]
+	descSlice := readBufferBytes(uintptr(descAddr), 16*int(size))
+	if descSlice == nil {
+		return
+	}
+	length := process(descSlice, head)
+	usedSlice := readBufferBytes(uintptr(usedAddr), 4+8*int(size))
+	if usedSlice == nil {
+		return
+	}
+	usedIdx := le.Uint16(usedSlice[2:4])
+	slot := usedIdx % size
+	uo := 4 + int(slot)*8
+	le.PutUint32(usedSlice[uo:uo+4], uint32(head))
+	le.PutUint32(usedSlice[uo+4:uo+8], length)
+	le.PutUint16(usedSlice[2:4], usedIdx+1)
+}
+
+// pushEvent writes one virtio_snd_event into the next-available eventq
+// buffer and publishes a used-ring entry for it. Used by the eventq
+// tests to inject period-elapsed / xrun / ctl-notify events.
+func (d *fakeSoundDevice) pushEvent(code, data uint32) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	availAddr := d.qdriver[EventQueueIdx]
+	usedAddr := d.qdevice[EventQueueIdx]
+	descAddr := d.qdesc[EventQueueIdx]
+	if availAddr == 0 || usedAddr == 0 || descAddr == 0 {
+		return
+	}
+	size := d.qsize[EventQueueIdx]
+	availSlice := readBufferBytes(uintptr(availAddr), 4+2*int(size))
+	usedSlice := readBufferBytes(uintptr(usedAddr), 4+8*int(size))
+	descSlice := readBufferBytes(uintptr(descAddr), 16*int(size))
+	if availSlice == nil || usedSlice == nil || descSlice == nil {
+		return
+	}
+	availIdx := le.Uint16(availSlice[2:4])
+	if availIdx == 0 {
+		return
+	}
+	usedIdx := le.Uint16(usedSlice[2:4])
+	// Use the next un-consumed avail slot, i.e. usedIdx itself.
+	slot := usedIdx % size
+	head := le.Uint16(availSlice[4+slot*2 : 4+slot*2+2])
+	// Write the 8-byte event into the head descriptor's data buffer.
+	o := int(head) * 16
+	addr := le.Uint64(descSlice[o : o+8])
+	length := le.Uint32(descSlice[o+8 : o+12])
+	if length < 8 {
+		return
+	}
+	mem := readBufferBytes(uintptr(addr), 8)
+	if mem == nil {
+		return
+	}
+	le.PutUint32(mem[0:4], code)
+	le.PutUint32(mem[4:8], data)
+	// Publish the used-ring entry.
+	uo := 4 + int(slot)*8
+	le.PutUint32(usedSlice[uo:uo+4], uint32(head))
+	le.PutUint32(usedSlice[uo+4:uo+8], 8)
 	le.PutUint16(usedSlice[2:4], usedIdx+1)
 }
 
@@ -437,19 +592,85 @@ func (d *fakeSoundDevice) processControl(desc []byte, head uint16) uint32 {
 		count := uint32(len(plBytes)) / PCMInfoEntrySize
 		for s := uint32(0); s < count; s++ {
 			off := int(s * PCMInfoEntrySize)
-			// hda_fn_nid
-			le.PutUint32(plBytes[off:off+4], 0x1000+s)
-			// features
-			le.PutUint32(plBytes[off+16:off+20], 0)
-			// formats: only S16
-			le.PutUint64(plBytes[off+20:off+28], 1<<PCMFmtS16)
-			// rates: only 44100
-			le.PutUint64(plBytes[off+28:off+36], 1<<PCMRate44100)
-			// direction: 0 for first stream, 1 for second
-			plBytes[off+36] = uint8(s)
-			plBytes[off+37] = 1 // channels_min
-			plBytes[off+38] = 2 // channels_max
+			info, ok := d.pcmInfoOverrides[s]
+			if !ok {
+				// Defaults: stream 0 = output, stream 1 = input.
+				info = PCMInfoEntry{
+					HDAFnGroup:  0x1000 + s,
+					Features:    0,
+					Formats:     1 << PCMFmtS16,
+					Rates:       1 << PCMRate44100,
+					Direction:   uint8(s),
+					ChannelsMin: 1,
+					ChannelsMax: 2,
+				}
+			}
+			le.PutUint32(plBytes[off:off+4], info.HDAFnGroup)
+			le.PutUint32(plBytes[off+16:off+20], info.Features)
+			le.PutUint64(plBytes[off+20:off+28], info.Formats)
+			le.PutUint64(plBytes[off+28:off+36], info.Rates)
+			plBytes[off+36] = info.Direction
+			plBytes[off+37] = info.ChannelsMin
+			plBytes[off+38] = info.ChannelsMax
 		}
+	}
+	// PCM_SET_PARAMS: record the request for the test to inspect.
+	if code == RPCMSetParams {
+		d.lastSetParamsReq = append([]byte(nil), reqBytes...)
+	}
+	// CTL_INFO: emit one virtio_snd_ctl_info entry per registered
+	// control.
+	if code == RCtlInfo && len(addrs) >= 3 {
+		plBytes := readBufferBytes(uintptr(addrs[2]), int(lengths[2]))
+		count := uint32(len(plBytes)) / CtlInfoEntrySize
+		for i := uint32(0); i < count && int(i) < len(d.controls); i++ {
+			off := int(i * CtlInfoEntrySize)
+			c := d.controls[i]
+			copy(plBytes[off:off+16], c.HDA[:])
+			le.PutUint32(plBytes[off+16:off+20], c.Role)
+			le.PutUint32(plBytes[off+20:off+24], uint32(c.Type))
+			le.PutUint32(plBytes[off+24:off+28], uint32(c.Access))
+			le.PutUint32(plBytes[off+28:off+32], c.NumChannels)
+			le.PutUint32(plBytes[off+32:off+36], c.Min)
+			le.PutUint32(plBytes[off+36:off+40], c.Max)
+			le.PutUint32(plBytes[off+40:off+44], c.Step)
+			// Name: zero-fill then copy the prefix.
+			for k := 0; k < ControlNameMaxLen; k++ {
+				plBytes[off+44+k] = 0
+			}
+			n := len(c.Name)
+			if n > ControlNameMaxLen {
+				n = ControlNameMaxLen
+			}
+			copy(plBytes[off+44:off+44+n], []byte(c.Name)[:n])
+		}
+	}
+	// CTL_READ: return controlValues[id] packed as int32-LE.
+	if code == RCtlRead && len(addrs) >= 3 {
+		id := le.Uint32(reqBytes[4:8])
+		plBytes := readBufferBytes(uintptr(addrs[2]), int(lengths[2]))
+		vals := d.controlValues[id]
+		for i, v := range vals {
+			off := i * 4
+			if off+4 > len(plBytes) {
+				break
+			}
+			le.PutUint32(plBytes[off:off+4], uint32(v))
+		}
+	}
+	// CTL_WRITE: update controlValues[id] from the request body.
+	if code == RCtlWrite && len(reqBytes) >= 8 {
+		id := le.Uint32(reqBytes[4:8])
+		nvals := (len(reqBytes) - 8) / 4
+		vals := make([]int32, nvals)
+		for i := 0; i < nvals; i++ {
+			off := 8 + i*4
+			vals[i] = int32(le.Uint32(reqBytes[off : off+4]))
+		}
+		if d.controlValues == nil {
+			d.controlValues = map[uint32][]int32{}
+		}
+		d.controlValues[id] = vals
 	}
 	// Return the device-written byte count across the chain (header +
 	// optional payload).
@@ -601,13 +822,44 @@ func TestOpenVirtioSound_Success(t *testing.T) {
 }
 
 func TestOpenVirtioSound_IgnoresExtraDeviceBits(t *testing.T) {
-	d := newFakeSoundDevice(common.FeatureVersion1 | (1 << 40) | (1 << 0))
+	// v0.2.0 negotiates FeatureCTLS (bit 0) when the device offers it;
+	// bit 40 is reserved and must be masked out.
+	d := newFakeSoundDevice(common.FeatureVersion1 | (1 << 40) | FeatureCTLS)
 	v, err := OpenVirtioSound(d)
 	if err != nil {
 		t.Fatalf("OpenVirtioSound: %v", err)
 	}
-	if v.NegotiatedFeatures != common.FeatureVersion1 {
-		t.Errorf("Negotiated: got 0x%x, want 0x%x", v.NegotiatedFeatures, common.FeatureVersion1)
+	want := common.FeatureVersion1 | FeatureCTLS
+	if v.NegotiatedFeatures != want {
+		t.Errorf("Negotiated: got 0x%x, want 0x%x", v.NegotiatedFeatures, want)
+	}
+}
+
+func TestOpenVirtioSound_NoCTLS(t *testing.T) {
+	// When the host doesn't offer F_CTLS, v0.2.0 must still bring the
+	// device up — F_CTLS is opportunistic, not required.
+	d := newFakeSoundDevice(common.FeatureVersion1)
+	v, err := OpenVirtioSound(d)
+	if err != nil {
+		t.Fatalf("OpenVirtioSound: %v", err)
+	}
+	if v.ControlsFeatureNegotiated() {
+		t.Error("ControlsFeatureNegotiated should be false without F_CTLS")
+	}
+	if _, err := v.Controls(); !errors.Is(err, ErrControlsNotNegotiated) {
+		t.Errorf("got %v, want ErrControlsNotNegotiated", err)
+	}
+	if _, err := v.ControlRead(0); !errors.Is(err, ErrControlsNotNegotiated) {
+		t.Errorf("ControlRead: got %v, want ErrControlsNotNegotiated", err)
+	}
+	if err := v.ControlWrite(0, []int32{1}); !errors.Is(err, ErrControlsNotNegotiated) {
+		t.Errorf("ControlWrite: got %v, want ErrControlsNotNegotiated", err)
+	}
+	if err := v.SetVolume(0, 50); !errors.Is(err, ErrControlsNotNegotiated) {
+		t.Errorf("SetVolume: got %v, want ErrControlsNotNegotiated", err)
+	}
+	if err := v.SetMute(0, true); !errors.Is(err, ErrControlsNotNegotiated) {
+		t.Errorf("SetMute: got %v, want ErrControlsNotNegotiated", err)
 	}
 }
 
