@@ -44,7 +44,6 @@ jobs:
           # TEMP: track the pending big-endian virtqueue ring-index fix
           # (go-virtio/common#fix-be-virtqueue-rings). The s390x job below
           # needs it to pass; drop this `ref` once it lands on common@main.
-          ref: fix-be-virtqueue-rings
           path: common
       - uses: actions/setup-go@v5
         with:
@@ -105,7 +104,6 @@ jobs:
           # TEMP: track the pending big-endian virtqueue ring-index fix
           # (go-virtio/common#fix-be-virtqueue-rings). The s390x job below
           # needs it to pass; drop this `ref` once it lands on common@main.
-          ref: fix-be-virtqueue-rings
           path: common
       - uses: actions/setup-go@v5
         with:
