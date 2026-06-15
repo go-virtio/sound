@@ -1,7 +1,17 @@
 # go-virtio/sound CI — build, vet and test with coverage on every
-# push/PR. We keep the matrix small: this is a pure-Go package with no
-# OS-specific bits, so a single ubuntu runner per supported Go version
-# is enough.
+# push/PR, across all six 64-bit Go targets.
+#
+# virtio is a little-endian protocol (Virtio 1.1 §2.6: all ring and
+# config fields are little-endian). s390x is big-endian, so it is the
+# load-bearing target that catches endianness bugs in the virtqueue /
+# config codecs. We therefore run the full test suite natively on
+# amd64 + arm64 and under QEMU for riscv64, loong64, ppc64le and s390x.
+#
+# Native jobs keep the original invocation (race detector + checkptr=0 +
+# coverage gate). QEMU jobs cross-compile per-package test binaries
+# (CGO_ENABLED=0, no race — the race detector is not usable under
+# user-mode emulation) and execute them under `docker run --platform`,
+# then enforce the same coverage gate.
 
 name: ci
 
@@ -12,11 +22,18 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  # ---- native: amd64 + arm64 ------------------------------------------
+  native:
     strategy:
+      fail-fast: false
       matrix:
-        go-version: ["1.25.x"]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    name: native (${{ matrix.arch }})
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,10 +41,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: go-virtio/common
+          # TEMP: track the pending big-endian virtqueue ring-index fix
+          # (go-virtio/common#fix-be-virtqueue-rings). The s390x job below
+          # needs it to pass; drop this `ref` once it lands on common@main.
+          ref: fix-be-virtqueue-rings
           path: common
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version: stable
       - name: go vet
         working-directory: sound
         # -unsafeptr=false: buffer.go intentionally lifts a uintptr DMA
@@ -53,3 +74,86 @@ jobs:
             echo "coverage below 85% gate"
             exit 1
           }
+
+  # ---- emulated: riscv64, loong64, ppc64le, s390x ---------------------
+  emulated:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+            qemu: rv64,v=true,vlen=128
+          - arch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu: la464
+          - arch: ppc64le
+            image: debian:trixie
+            qemu: power9
+          - arch: s390x
+            image: debian:trixie
+            qemu: qemu
+    name: emulated (${{ matrix.arch }})
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sound
+      - uses: actions/checkout@v4
+        with:
+          repository: go-virtio/common
+          # TEMP: track the pending big-endian virtqueue ring-index fix
+          # (go-virtio/common#fix-be-virtqueue-rings). The s390x job below
+          # needs it to pass; drop this `ref` once it lands on common@main.
+          ref: fix-be-virtqueue-rings
+          path: common
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: register binfmt handlers
+        run: docker run --privileged --rm tonistiigi/binfmt --install all
+      - name: cross-compile per-package test binaries
+        working-directory: sound
+        # CGO_ENABLED=0 + no -race: the race detector is unsupported under
+        # QEMU user-mode emulation. We still build with coverage and run
+        # every package's test binary under emulation. (checkptr/unsafeptr
+        # are compile-time off-paths here; buffer.go's DMA view is only
+        # exercised at runtime, which we accept under emulation.)
+        run: |
+          mkdir -p /tmp/testbins
+          for pkg in $(go list ./...); do
+            name=$(echo "$pkg" | tr '/' '_')
+            GOOS=linux GOARCH=${{ matrix.arch }} CGO_ENABLED=0 \
+              go test -c -covermode=atomic -o "/tmp/testbins/${name}.test" "$pkg"
+          done
+      - name: run test binaries under QEMU + enforce coverage gate
+        run: |
+          set -euo pipefail
+          fail=0
+          for bin in /tmp/testbins/*.test; do
+            [ -e "$bin" ] || continue
+            echo "::group::$(basename "$bin")"
+            docker run --rm --platform linux/${{ matrix.arch }} \
+              -e QEMU_CPU='${{ matrix.qemu }}' \
+              -v /tmp/testbins:/t \
+              ${{ matrix.image }} \
+              "/t/$(basename "$bin")" \
+              -test.v -test.count=1 -test.coverprofile="/t/$(basename "$bin").cov" \
+              || fail=1
+            echo "::endgroup::"
+          done
+          # Merge coverage profiles and enforce the same 85% gate.
+          echo "mode: atomic" > /tmp/coverage.out
+          for cov in /tmp/testbins/*.cov; do
+            [ -e "$cov" ] || continue
+            tail -n +2 "$cov" >> /tmp/coverage.out
+          done
+          if [ -s /tmp/coverage.out ]; then
+            pct=$(go -C sound tool cover -func=/tmp/coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+            echo "coverage: ${pct}%"
+            awk -v p="$pct" 'BEGIN { exit (p+0 >= 85.0) ? 0 : 1 }' || {
+              echo "coverage below 85% gate"
+              fail=1
+            }
+          fi
+          exit $fail
