@@ -35,17 +35,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     name: native (${{ matrix.arch }})
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: sound
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: go-virtio/common
           # TEMP: track the pending big-endian virtqueue ring-index fix
           # (go-virtio/common#fix-be-virtqueue-rings). The s390x job below
           # needs it to pass; drop this `ref` once it lands on common@main.
           path: common
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: stable
       - name: go vet
