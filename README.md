@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-virtio/brand/main/social/go-virtio.png" alt="go-virtio/sound" width="720"></p>
+
 # go-virtio/sound
 
 Pure-Go virtio-sound driver targeting the `go-virtio/common` transport
