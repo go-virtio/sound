@@ -121,6 +121,15 @@ type VirtioSound struct {
 	// ReadEvents() call. v0.2.0 surfaces these to the caller; v0.1.0
 	// drained-on-busy-poll Write() ignored them.
 	pendingEvents []Event
+
+	// pendingTxq tracks Write() chains the busy-poll bailed on with
+	// ErrXferTimeout. Their descriptor slots stay InUse=true so the
+	// device's late status-trailer DMA can't clobber a subsequent
+	// caller's bytes; drainPendingTxq frees them once the used ring
+	// catches up. See playback.go's package-level comment for the
+	// rationale (the txq is fundamentally async + the head index gets
+	// reused, so completion correlation needs more than the head).
+	pendingTxq []pendingTxq
 }
 
 // streamState is the per-stream cache populated when the driver issues
