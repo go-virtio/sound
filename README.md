@@ -2,6 +2,10 @@
 
 # go-virtio/sound
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-virtio/sound.svg)](https://pkg.go.dev/github.com/go-virtio/sound)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![CI](https://github.com/go-virtio/sound/actions/workflows/ci.yml/badge.svg)](https://github.com/go-virtio/sound/actions/workflows/ci.yml)
+
 Pure-Go virtio-sound driver targeting the `go-virtio/common` transport
 interfaces. Implements the modern-transport (Virtio 1.2+) init sequence
 and the minimum PCM playback + capture data paths for the standard
