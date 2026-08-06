@@ -587,8 +587,9 @@ func (d *fakeSoundDevice) processControl(desc []byte, head uint16) uint32 {
 	// PCM_INFO: seed the payload so the test can verify a round-trip.
 	if code == RPCMInfo && len(addrs) >= 3 {
 		plBytes := readBufferBytes(uintptr(addrs[2]), int(lengths[2]))
-		// Per stream: 48-byte virtio_snd_pcm_info.
-		// Stream 0 = output, stream 1 = input.
+		// Per stream: 32-byte virtio_snd_pcm_info (struct
+		// virtio_snd_info is 4 bytes -- just le32 hda_fn_nid -- no
+		// padding). Stream 0 = output, stream 1 = input.
 		count := uint32(len(plBytes)) / PCMInfoEntrySize
 		for s := uint32(0); s < count; s++ {
 			off := int(s * PCMInfoEntrySize)
@@ -606,12 +607,12 @@ func (d *fakeSoundDevice) processControl(desc []byte, head uint16) uint32 {
 				}
 			}
 			le.PutUint32(plBytes[off:off+4], info.HDAFnGroup)
-			le.PutUint32(plBytes[off+16:off+20], info.Features)
-			le.PutUint64(plBytes[off+20:off+28], info.Formats)
-			le.PutUint64(plBytes[off+28:off+36], info.Rates)
-			plBytes[off+36] = info.Direction
-			plBytes[off+37] = info.ChannelsMin
-			plBytes[off+38] = info.ChannelsMax
+			le.PutUint32(plBytes[off+4:off+8], info.Features)
+			le.PutUint64(plBytes[off+8:off+16], info.Formats)
+			le.PutUint64(plBytes[off+16:off+24], info.Rates)
+			plBytes[off+24] = info.Direction
+			plBytes[off+25] = info.ChannelsMin
+			plBytes[off+26] = info.ChannelsMax
 		}
 	}
 	// PCM_SET_PARAMS: record the request for the test to inspect.

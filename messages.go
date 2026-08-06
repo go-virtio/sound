@@ -366,21 +366,33 @@ const (
 	// PCMInfoEntrySize is sizeof(struct virtio_snd_pcm_info) — the
 	// per-stream info record returned by R_PCM_INFO.
 	//
-	//	struct virtio_snd_info {       // 16 bytes
+	//	struct virtio_snd_info {       // 4 bytes
 	//	    le32 hda_fn_nid;
-	//	    u8   _padding[12];
 	//	};
-	//	struct virtio_snd_pcm_info {   // 48 bytes total
-	//	    struct virtio_snd_info hdr;     // +0  ..+16
-	//	    le32 features;                  // +16 ..+20
-	//	    le64 formats;                   // +20 ..+28
-	//	    le64 rates;                     // +28 ..+36
-	//	    u8   direction;                 // +36
-	//	    u8   channels_min;              // +37
-	//	    u8   channels_max;              // +38
-	//	    u8   _padding[9];               // +39 ..+48
+	//	struct virtio_snd_pcm_info {   // 32 bytes total
+	//	    struct virtio_snd_info hdr;     // +0  ..+4
+	//	    le32 features;                  // +4  ..+8
+	//	    le64 formats;                   // +8  ..+16
+	//	    le64 rates;                     // +16 ..+24
+	//	    u8   direction;                 // +24
+	//	    u8   channels_min;              // +25
+	//	    u8   channels_max;              // +26
+	//	    u8   _padding[5];               // +27 ..+32
 	//	};
-	PCMInfoEntrySize uint32 = 48
+	//
+	// IMPORTANT: struct virtio_snd_info is 4 bytes (just le32
+	// hda_fn_nid) per UAPI <linux/virtio_snd.h> — there is NO
+	// 12-byte padding. QEMU's virtio-snd-pci writes exactly 32
+	// bytes per entry on the controlq response and ignores the
+	// `size` field the driver passes in R_PCM_INFO. Earlier
+	// versions of this file claimed 48; that mis-aligned the
+	// formats/rates fields against the wire payload and made
+	// every advertised stream look like rates=0x0 / wrong-bit
+	// formats, which in turn broke the engine-side
+	// PCMSetParams negotiation. Real measurement: QEMU 9.x +
+	// quake-tamago boot — Direction=0, Rates=0x1FFF (every
+	// PCMRate*), Formats=0x70F (S8/U8/S16/U16/S32/U32/FLOAT).
+	PCMInfoEntrySize uint32 = 32
 
 	// PCMXferHdrSize is sizeof(struct virtio_snd_pcm_xfer) — the 4-byte
 	// header (`le32 stream_id`) every PCM data-queue request prepends
@@ -513,7 +525,7 @@ func parseHdr(b []byte) (uint32, error) {
 }
 
 // parsePCMInfoEntry decodes one virtio_snd_pcm_info record
-// (PCMInfoEntrySize = 48 bytes). Returns ErrShortResponse if the
+// (PCMInfoEntrySize = 32 bytes). Returns ErrShortResponse if the
 // buffer is undersized. Layout matches the comment block above
 // PCMInfoEntrySize.
 func parsePCMInfoEntry(b []byte) (PCMInfoEntry, error) {
@@ -521,14 +533,18 @@ func parsePCMInfoEntry(b []byte) (PCMInfoEntry, error) {
 	if uint32(len(b)) < PCMInfoEntrySize {
 		return out, ErrShortResponse
 	}
+	// struct virtio_snd_info is just le32 hda_fn_nid (4 bytes, no
+	// padding); the inner fields start at offset 4. See the
+	// PCMInfoEntrySize doc-block for the on-the-wire layout and
+	// the QEMU measurement that caught the earlier 48-byte mis-
+	// alignment which read every rates field as 0x0.
 	out.HDAFnGroup = le.Uint32(b[0:4])
-	// b[4:16] is padding from struct virtio_snd_info.
-	out.Features = le.Uint32(b[16:20])
-	out.Formats = le.Uint64(b[20:28])
-	out.Rates = le.Uint64(b[28:36])
-	out.Direction = b[36]
-	out.ChannelsMin = b[37]
-	out.ChannelsMax = b[38]
-	// b[39:48] is trailing padding.
+	out.Features = le.Uint32(b[4:8])
+	out.Formats = le.Uint64(b[8:16])
+	out.Rates = le.Uint64(b[16:24])
+	out.Direction = b[24]
+	out.ChannelsMin = b[25]
+	out.ChannelsMax = b[26]
+	// b[27:32] is trailing padding.
 	return out, nil
 }
