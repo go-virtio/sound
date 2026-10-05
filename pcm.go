@@ -203,4 +203,3 @@ func (v *VirtioSound) checkStreamID(streamID uint32) error {
 	}
 	return nil
 }
-

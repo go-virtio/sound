@@ -236,12 +236,12 @@ type PCMFormat uint64
 
 // PCMFormat single-format constants — `1 << <byte id>`.
 const (
-	FormatUnknown PCMFormat = 0
+	FormatUnknown  PCMFormat = 0
 	FormatImaAdpcm PCMFormat = 1 << PCMFmtImaAdpcm
 	FormatMuLaw    PCMFormat = 1 << PCMFmtMuLaw
 	FormatALaw     PCMFormat = 1 << PCMFmtALaw
 	FormatS8       PCMFormat = 1 << PCMFmtS8
-	FormatU8       PCMFormat = 1 << PCMFmtU8       // DOOM (PC speaker / WAV)
+	FormatU8       PCMFormat = 1 << PCMFmtU8 // DOOM (PC speaker / WAV)
 	FormatS16LE    PCMFormat = 1 << PCMFmtS16
 	FormatU16LE    PCMFormat = 1 << PCMFmtU16
 	FormatS18Pad3  PCMFormat = 1 << PCMFmtS18Pad3
